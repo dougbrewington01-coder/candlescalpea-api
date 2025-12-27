@@ -405,6 +405,6 @@ app.get("/health", (req, res) => {
 // ------------------------------
 // LISTEN
 // ------------------------------
-app.listen(PORT, () => {
-  console.log(`API listening on port ${PORT}`);
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, '0.0.0.0');
 });
