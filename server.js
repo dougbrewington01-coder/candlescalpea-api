@@ -1,492 +1,405 @@
-//-------------------------------------------------------------------
-// DAILY STATS UPDATE (uses custom day anchor)
-//-------------------------------------------------------------------
-void UpdateDailyStats()
-{
-   datetime now = TimeCurrent();
-   datetime day_anchor = DayWindowStart(now);
+// ==============================
+// server.js (FULL FILE - FINAL)
+// PayPal Webhooks + License Check (Clean YES/NO)
+// ES Modules version
+// ==============================
 
-   if(g_current_day != day_anchor)
-   {
-      g_current_day = day_anchor;
-      g_day_equity_start = GetEquity();
-      g_day_equity_peak  = GetEquity();
-      g_daily_loss_hit = false;
-      g_daily_profit_cap_hit = false;
-      g_daily_safe_day_hit = false;
+import express from "express";
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
+import fetch from "node-fetch";
 
-      RebuildRiskTodayClosedPLFromHistory();
-      SaveDailyStateToGV();
-   }
-   else
-   {
-      double eq = GetEquity();
-      if(eq > g_day_equity_peak) g_day_equity_peak = eq;
-      SaveDailyStateToGV();
-   }
+// ------------------------------
+// APP SETUP
+// ------------------------------
+const app = express();
+
+// IMPORTANT:
+// - PayPal webhook MUST receive RAW body for signature verification.
+// - Everything else uses normal JSON.
+app.use(express.json({ limit: "1mb" }));
+
+// ------------------------------
+// ENV / CONFIG
+// ------------------------------
+const PORT = process.env.PORT || 8080;
+
+// REQUIRED (set in your App Platform env vars):
+// PAYPAL_CLIENT_ID=...
+// PAYPAL_SECRET=...
+// PAYPAL_WEBHOOK_ID=...
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "";
+const PAYPAL_SECRET = process.env.PAYPAL_SECRET || "";
+const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || "";
+
+// OPTIONAL (recommended): EA sends this header: x-csea-key
+// CSEA_API_KEY=some-long-random
+const CSEA_API_KEY = process.env.CSEA_API_KEY || "";
+
+// Live vs Sandbox
+const PAYPAL_BASE =
+  process.env.PAYPAL_ENV === "sandbox"
+    ? "https://api-m.sandbox.paypal.com"
+    : "https://api-m.paypal.com";
+
+// ------------------------------
+// SIMPLE JSON "DB"
+// ------------------------------
+const DATA_DIR = path.join(process.cwd(), "data");
+const USERS_FILE = path.join(DATA_DIR, "users.json");
+
+// users.json example shape:
+// [
+//   {
+//     "email": "user@email.com",
+//     "email_verified": true,
+//     "subscription_status": "active",   // active | past_due | canceled | locked
+//     "paypal_subscription_id": "I-XXXX",
+//     "paypal_payer_id": "XXXX",
+//     "nickname": "Domino",              // CASE-SENSITIVE
+//     "mt5_account": "12345678",         // optional bind
+//     "promo_used": "",
+//     "created_at": "2025-12-27T00:00:00Z",
+//     "updated_at": "2025-12-27T00:00:00Z"
+//   }
+// ]
+
+function ensureDataStore() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, "[]", "utf8");
 }
 
-//-------------------------------------------------------------------
-// POSITIONS
-//-------------------------------------------------------------------
-bool HasOpenPosition()
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket)) continue;
-
-      string sym   = PositionGetString(POSITION_SYMBOL);
-      long   magic = PositionGetInteger(POSITION_MAGIC);
-
-      if(sym == _Symbol && magic == InpMagicNumber) return true;
-   }
-   return false;
+function readUsers() {
+  ensureDataStore();
+  try {
+    return JSON.parse(fs.readFileSync(USERS_FILE, "utf8") || "[]");
+  } catch {
+    return [];
+  }
 }
 
-void CloseAllPositionsForSymbol()
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket)) continue;
-
-      string sym   = PositionGetString(POSITION_SYMBOL);
-      long   magic = PositionGetInteger(POSITION_MAGIC);
-
-      if(sym == _Symbol && magic == InpMagicNumber)
-         trade.PositionClose(ticket, (ulong)InpSlippage);
-   }
+function writeUsers(users) {
+  ensureDataStore();
+  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), "utf8");
 }
 
-//-------------------------------------------------------------------
-// DAILY LOSS PROTECTION (equity drawdown from peak)
-//-------------------------------------------------------------------
-double GetDailyLossLimitAmount()
-{
-   double acc_size = GetConfiguredAccountSize();
-   if(acc_size <= 0.0) acc_size = GetBalance();
-
-   if(InpDailyLossFixedAmount > 0.0) return InpDailyLossFixedAmount;
-   return acc_size * InpDailyLossPercent / 100.0;
+function nowISO() {
+  return new Date().toISOString();
 }
 
-bool CheckDailyLossLimit()
-{
-   if(!InpUseDailyLossProtection) return false;
-
-   double limit = GetDailyLossLimitAmount();
-   double eq = GetEquity();
-   double drawdown = g_day_equity_peak - eq;
-
-   if(drawdown >= limit && !g_daily_loss_hit)
-   {
-      if(InpCloseAllOnDailyLoss) CloseAllPositionsForSymbol();
-      g_daily_loss_hit = true;
-      SaveDailyStateToGV();
-   }
-
-   if(g_daily_loss_hit && InpBlockTradingAfterLoss) return true;
-   return false;
+// ------------------------------
+// HELPERS
+// ------------------------------
+function normStr(v) {
+  return typeof v === "string" ? v.trim() : "";
 }
 
-//-------------------------------------------------------------------
-// DAILY PROFIT CAP (closed-deals net for day window)
-//-------------------------------------------------------------------
-double GetDailyProfitCapAmount()
-{
-   double acc_size = GetConfiguredAccountSize();
-   if(acc_size <= 0.0) acc_size = GetBalance();
-
-   if(InpDailyProfitFixedCap > 0.0) return InpDailyProfitFixedCap;
-   return acc_size * InpDailyProfitPercentCap / 100.0;
+function isDigits(v) {
+  return /^[0-9]+$/.test(v);
 }
 
-bool CheckDailyProfitCap()
-{
-   if(!InpUseDailyProfitCap) return false;
-
-   double cap = GetDailyProfitCapAmount();
-   double net_today = g_risk_today_profit - g_risk_today_loss;
-
-   if(net_today >= cap) g_daily_profit_cap_hit = true;
-   SaveDailyStateToGV();
-   return g_daily_profit_cap_hit;
+function sendOk(res) {
+  return res.status(200).json({ ok: true });
 }
 
-//-------------------------------------------------------------------
-// SAFE/DAY STOP (keeps trading until you CLEAR safe_day + buffer)
-//-------------------------------------------------------------------
-double GetSafeDayTarget()
-{
-   double target = GetHUDTargetAmount();
-   if(target <= 0.0) return 0.0;
-   return target / 5.0;
+function sendNo(res, reason = "not_allowed") {
+  return res.status(200).json({ ok: false, reason: String(reason || "not_allowed") });
 }
 
-bool CheckSafeDayStop()
-{
-   if(!InpStopAfterSafeDayHit) return false;
-
-   double safe = GetSafeDayTarget();
-   if(safe <= 0.0) return false;
-
-   double buffer = InpSafeDayBufferAmount;
-   if(buffer < 0.0) buffer = 0.0;
-
-   double required = safe + buffer;
-
-   double net_today = g_risk_today_profit - g_risk_today_loss;
-
-   if(net_today >= required)
-   {
-      g_daily_safe_day_hit = true;
-      SaveDailyStateToGV();
-      return true;
-   }
-
-   return false;
+// OPTIONAL: protect endpoints with API key (timing-safe)
+function checkApiKey(req) {
+  if (!CSEA_API_KEY) return true; // if not set, skip enforcement
+  const got = (req.headers["x-csea-key"] || "").toString().trim();
+  if (!got) return false;
+  if (got.length !== CSEA_API_KEY.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(got), Buffer.from(CSEA_API_KEY));
 }
 
-//-------------------------------------------------------------------
-// ROLLOVER / WEEKEND / SPREAD
-//-------------------------------------------------------------------
-bool IsInRolloverBlock()
-{
-   if(!InpUseRolloverBlock) return false;
+// ------------------------------
+// PAYPAL API HELPERS (NO SDK)
+// ------------------------------
+async function paypalGetAccessToken() {
+  if (!PAYPAL_CLIENT_ID || !PAYPAL_SECRET) {
+    throw new Error("Missing PayPal credentials");
+  }
 
-   datetime now = TimeCurrent();
-   MqlDateTime st; TimeToStruct(now, st);
+  const basic = Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`).toString("base64");
 
-   int minutes = st.hour * 60 + st.min;
-   int day_minutes = 24 * 60;
+  const resp = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${basic}`,
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: "grant_type=client_credentials",
+  });
 
-   int before = InpNoTradeMinutesBeforeMidnight;
-   int after  = InpNoTradeMinutesAfterMidnight;
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`PayPal token error: ${resp.status} ${text}`);
+  }
 
-   if(before < 0) before = 0;
-   if(after  < 0) after  = 0;
-   if(before > day_minutes) before = day_minutes;
-   if(after  > day_minutes) after  = day_minutes;
-
-   if(minutes >= day_minutes - before || minutes < after) return true;
-   return false;
+  const data = await resp.json();
+  return data.access_token;
 }
 
-bool WeekendBlock()
-{
-   if(!InpUseWeekendProtection) return false;
+async function paypalVerifyWebhookSignature({ headers, rawBody }) {
+  if (!PAYPAL_WEBHOOK_ID) throw new Error("Missing PAYPAL_WEBHOOK_ID");
 
-   datetime now = TimeCurrent();
-   MqlDateTime st; TimeToStruct(now, st);
+  const accessToken = await paypalGetAccessToken();
 
-   int dow = st.day_of_week;
-   int minutes = st.hour * 60 + st.min;
-   int day_mins = 24 * 60;
+  const body = {
+    auth_algo: headers["paypal-auth-algo"],
+    cert_url: headers["paypal-cert-url"],
+    transmission_id: headers["paypal-transmission-id"],
+    transmission_sig: headers["paypal-transmission-sig"],
+    transmission_time: headers["paypal-transmission-time"],
+    webhook_id: PAYPAL_WEBHOOK_ID,
+    webhook_event: JSON.parse(rawBody || "{}"),
+  };
 
-   if(dow == 6) return true; // Saturday
+  const resp = await fetch(`${PAYPAL_BASE}/v1/notifications/verify-webhook-signature`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
 
-   if(dow == 5) // Friday
-   {
-      int block_before = InpFridayNoNewTradeMinutesBeforeMidnight;
-      int close_before = InpFridayCloseMinutesBeforeMidnight;
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Verify webhook error: ${resp.status} ${text}`);
+  }
 
-      if(block_before < 0) block_before = 0;
-      if(close_before < 0) close_before = 0;
-      if(block_before > day_mins) block_before = day_mins;
-      if(close_before > day_mins) close_before = day_mins;
+  const data = await resp.json();
+  return data.verification_status === "SUCCESS";
+}
 
-      if(minutes >= day_mins - close_before)
-      {
-         CloseAllPositionsForSymbol();
-         return true;
+// ------------------------------
+// USER LOOKUPS (CASE-SENSITIVE nickname)
+// ------------------------------
+function getUserByNickname(users, nickname) {
+  return users.find((u) => u.nickname === nickname) || null;
+}
+
+function getUserBySubscriptionId(users, subId) {
+  const id = normStr(subId);
+  return users.find((u) => normStr(u.paypal_subscription_id) === id) || null;
+}
+
+// ------------------------------
+// LICENSE DECISION (CLEAN YES/NO)
+// ------------------------------
+function evaluateLicense(user, mt5Account) {
+  if (!user) return { ok: false, reason: "user_not_found" };
+
+  if (user.email_verified === false) return { ok: false, reason: "email_unverified" };
+
+  const status = normStr(user.subscription_status).toLowerCase();
+
+  if (status === "locked") return { ok: false, reason: "account_locked" };
+  if (status !== "active") return { ok: false, reason: "subscription_inactive" };
+
+  // MT5 bind rule: if already bound, must match
+  if (user.mt5_account && String(user.mt5_account) !== String(mt5Account)) {
+    return { ok: false, reason: "mt5_mismatch" };
+  }
+
+  return { ok: true };
+}
+
+// If active + not bound => bind now (first successful license check binds MT5)
+function bindMt5IfNeeded(users, user, mt5Account) {
+  if (!user.mt5_account) {
+    user.mt5_account = String(mt5Account);
+    user.updated_at = nowISO();
+    writeUsers(users);
+  }
+}
+
+// ------------------------------
+// LICENSE CHECK ROUTES (EA calls these)
+// Always returns 200 + JSON {ok:true/false}
+// ------------------------------
+async function licenseCheckHandler(req, res) {
+  try {
+    if (!checkApiKey(req)) return sendNo(res, "bad_api_key");
+
+    const nickname = normStr(req.body?.nickname ?? req.query?.nickname);
+    const mt5 = normStr(
+      req.body?.mt5 ??
+        req.body?.account ??
+        req.body?.mt5_account ??
+        req.query?.mt5 ??
+        req.query?.account ??
+        req.query?.mt5_account
+    );
+
+    if (!nickname) return sendNo(res, "missing_nickname");
+    if (!mt5 || !isDigits(mt5)) return sendNo(res, "missing_or_bad_mt5");
+
+    const users = readUsers();
+    const user = getUserByNickname(users, nickname);
+
+    const result = evaluateLicense(user, mt5);
+    if (!result.ok) return sendNo(res, result.reason || "not_allowed");
+
+    bindMt5IfNeeded(users, user, mt5);
+    return sendOk(res);
+  } catch {
+    return sendNo(res, "server_error");
+  }
+}
+
+// Aliases so any EA path still works
+app.post("/license/check", licenseCheckHandler);
+app.post("/api/license/check", licenseCheckHandler);
+app.post("/license", licenseCheckHandler);
+app.post("/api/license", licenseCheckHandler);
+
+app.get("/license/check", licenseCheckHandler);
+app.get("/api/license/check", licenseCheckHandler);
+app.get("/license", licenseCheckHandler);
+app.get("/api/license", licenseCheckHandler);
+
+// ------------------------------
+// PAYPAL WEBHOOK (RAW BODY + VERIFY)
+// ------------------------------
+app.post("/paypal/webhook", express.raw({ type: "*/*", limit: "2mb" }), async (req, res) => {
+  try {
+    const rawBody = req.body ? req.body.toString("utf8") : "";
+
+    // Verify signature (PRODUCTION SAFE)
+    const verified = await paypalVerifyWebhookSignature({
+      headers: req.headers,
+      rawBody,
+    });
+
+    if (!verified) {
+      // return 200 so PayPal doesn't hammer retries
+      return res.status(200).json({ ok: false, reason: "webhook_not_verified" });
+    }
+
+    let event = {};
+    try {
+      event = rawBody ? JSON.parse(rawBody) : {};
+    } catch {
+      return res.status(200).json({ ok: false, reason: "bad_json" });
+    }
+
+    const eventType = normStr(event.event_type).toUpperCase();
+    const resource = event.resource || {};
+    const subscriptionId = normStr(resource.id);
+
+    const users = readUsers();
+    const user = subscriptionId ? getUserBySubscriptionId(users, subscriptionId) : null;
+
+    // If we can’t map it, just acknowledge
+    if (!user) return res.status(200).json({ ok: true, note: "no_user_match" });
+
+    // Map PayPal event -> your subscription_status
+    if (eventType === "BILLING.SUBSCRIPTION.ACTIVATED") {
+      user.subscription_status = "active";
+      user.updated_at = nowISO();
+      writeUsers(users);
+    } else if (eventType === "BILLING.SUBSCRIPTION.CANCELLED") {
+      user.subscription_status = "canceled";
+      user.updated_at = nowISO();
+      writeUsers(users);
+    } else if (eventType === "BILLING.SUBSCRIPTION.SUSPENDED") {
+      user.subscription_status = "past_due";
+      user.updated_at = nowISO();
+      writeUsers(users);
+    } else if (eventType === "BILLING.SUBSCRIPTION.EXPIRED") {
+      user.subscription_status = "canceled";
+      user.updated_at = nowISO();
+      writeUsers(users);
+    } else if (eventType === "BILLING.SUBSCRIPTION.UPDATED") {
+      user.updated_at = nowISO();
+      writeUsers(users);
+    }
+
+    // Optional: payment completion can mark active (unless locked)
+    if (eventType === "PAYMENT.CAPTURE.COMPLETED" || eventType === "PAYMENT.SALE.COMPLETED") {
+      if (normStr(user.subscription_status).toLowerCase() !== "locked") {
+        user.subscription_status = "active";
+        user.updated_at = nowISO();
+        writeUsers(users);
       }
+    }
 
-      if(minutes >= day_mins - block_before) return true;
-   }
+    return res.status(200).json({ ok: true });
+  } catch {
+    // Always 200 to stop retry storms
+    return res.status(200).json({ ok: false, reason: "webhook_error" });
+  }
+});
 
-   return false;
-}
+// ------------------------------
+// ADMIN-HELPER ENDPOINTS (OPTIONAL)
+// ------------------------------
+app.post("/admin/dev-upsert-user", (req, res) => {
+  try {
+    const body = req.body || {};
+    const email = normStr(body.email);
+    const nickname = body.nickname; // KEEP CASE-SENSITIVE as given
+    const paypal_subscription_id = normStr(body.paypal_subscription_id);
+    const email_verified = !!body.email_verified;
 
-bool IsSpreadTooHigh()
-{
-   if(!InpUseMaxSpreadFilter) return false;
+    if (!email || !nickname) {
+      return res.status(200).json({ ok: false, reason: "missing_email_or_nickname" });
+    }
 
-   double pip = PipSize();
-   if(pip <= 0.0) return false;
+    const users = readUsers();
+    let user = users.find((u) => normStr(u.email).toLowerCase() === email.toLowerCase());
 
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    if (!user) {
+      user = {
+        email,
+        email_verified,
+        subscription_status: normStr(body.subscription_status) || "active",
+        paypal_subscription_id: paypal_subscription_id || "",
+        paypal_payer_id: normStr(body.paypal_payer_id) || "",
+        nickname,
+        mt5_account: normStr(body.mt5_account) || "",
+        promo_used: normStr(body.promo_used) || "",
+        created_at: nowISO(),
+        updated_at: nowISO(),
+      };
+      users.push(user);
+    } else {
+      user.email = email;
+      user.nickname = nickname;
+      if (paypal_subscription_id) user.paypal_subscription_id = paypal_subscription_id;
+      user.email_verified = email_verified;
+      if (body.subscription_status) user.subscription_status = normStr(body.subscription_status);
+      if (body.mt5_account !== undefined) user.mt5_account = normStr(body.mt5_account);
+      user.updated_at = nowISO();
+    }
 
-   double spread_pips = (ask - bid) / pip;
-   return (spread_pips > InpMaxSpreadPips);
-}
+    writeUsers(users);
+    return res.status(200).json({ ok: true });
+  } catch {
+    return res.status(200).json({ ok: false, reason: "server_error" });
+  }
+});
 
-//-------------------------------------------------------------------
-// STOP-LOSS HELPERS (hard SL + enforce if missing)
-//-------------------------------------------------------------------
-double MinStopDistancePrice()
-{
-   int stops_level_points = (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   if(stops_level_points < 0) stops_level_points = 0;
-   return (double)stops_level_points * _Point;
-}
+app.get("/admin/dev-users", (req, res) => {
+  const users = readUsers();
+  return res.status(200).json({ ok: true, users });
+});
 
-double CalcHardSLPrice(const bool is_buy, const double entry_price)
-{
-   double pip = PipSize();
-   double dist = InpTrailingStopPips * pip;
-   double min_dist = MinStopDistancePrice();
+// ------------------------------
+// HEALTH
+// ------------------------------
+app.get("/", (req, res) => res.status(200).send("CandleScalpEA API is running."));
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
-   if(dist <= 0.0) dist = min_dist;
-
-   if(is_buy)
-   {
-      double sl = entry_price - dist;
-      if(min_dist > 0.0 && (entry_price - sl) < min_dist) sl = entry_price - min_dist;
-      return sl;
-   }
-   else
-   {
-      double sl = entry_price + dist;
-      if(min_dist > 0.0 && (sl - entry_price) < min_dist) sl = entry_price + min_dist;
-      return sl;
-   }
-}
-
-void EnforceHardSLIfMissing()
-{
-   if(!InpUseHardStopAtEntry) return;
-   if(InpTrailingStopPips <= 0.0) return;
-
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket)) continue;
-
-      string sym = PositionGetString(POSITION_SYMBOL);
-      long magic = PositionGetInteger(POSITION_MAGIC);
-      if(sym != _Symbol || magic != InpMagicNumber) continue;
-
-      long type = PositionGetInteger(POSITION_TYPE);
-      double cur_sl= PositionGetDouble(POSITION_SL);
-      double cur_tp= PositionGetDouble(POSITION_TP);
-
-      if(cur_sl > 0.0) continue;
-
-      trade.SetExpertMagicNumber(InpMagicNumber);
-      trade.SetDeviationInPoints(InpSlippage);
-
-      if(type == POSITION_TYPE_BUY)
-      {
-         double sl = CalcHardSLPrice(true, ask);
-         trade.PositionModify(sym, sl, cur_tp);
-      }
-      else if(type == POSITION_TYPE_SELL)
-      {
-         double sl = CalcHardSLPrice(false, bid);
-         trade.PositionModify(sym, sl, cur_tp);
-      }
-   }
-}
-
-//-------------------------------------------------------------------
-// TRAILING STOP
-//-------------------------------------------------------------------
-void ApplyTrailingStop()
-{
-   if(InpTrailingStopPips <= 0.0) return;
-
-   double pip = PipSize();
-   double trail_dist = InpTrailingStopPips * pip;
-   double min_stop_distance = MinStopDistancePrice();
-
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket)) continue;
-
-      string sym = PositionGetString(POSITION_SYMBOL);
-      long magic = PositionGetInteger(POSITION_MAGIC);
-      if(sym != _Symbol || magic != InpMagicNumber) continue;
-
-      long type = PositionGetInteger(POSITION_TYPE);
-      double cur_sl= PositionGetDouble(POSITION_SL);
-      double cur_tp= PositionGetDouble(POSITION_TP);
-
-      trade.SetExpertMagicNumber(InpMagicNumber);
-      trade.SetDeviationInPoints(InpSlippage);
-
-      if(type == POSITION_TYPE_BUY)
-      {
-         double desired_sl = bid - trail_dist;
-         if(min_stop_distance > 0.0 && (bid - desired_sl) < min_stop_distance) desired_sl = bid - min_stop_distance;
-
-         if(cur_sl <= 0.0 || desired_sl > cur_sl)
-            trade.PositionModify(sym, desired_sl, cur_tp);
-      }
-      else if(type == POSITION_TYPE_SELL)
-      {
-         double desired_sl = ask + trail_dist;
-         if(min_stop_distance > 0.0 && (desired_sl - ask) < min_stop_distance) desired_sl = ask + min_stop_distance;
-
-         if(cur_sl <= 0.0 || desired_sl < cur_sl)
-            trade.PositionModify(sym, desired_sl, cur_tp);
-      }
-   }
-}
-
-//-------------------------------------------------------------------
-// MT5 EVENT (on any deal, rebuild today's closed P/L for risk vars)
-//-------------------------------------------------------------------
-void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
-{
-   if(trans.type != TRADE_TRANSACTION_DEAL_ADD) return;
-   RebuildRiskTodayClosedPLFromHistory();
-   DrawDailyHUD();
-}
-
-//-------------------------------------------------------------------
-// TIMER (prevents HUD freezing / disappearing)
-//-------------------------------------------------------------------
-void OnTimer()
-{
-   UpdateDailyStats();
-   DrawDailyHUD();
-
-   // license polling (ADD-ONLY)
-   if(InpUseLicenseEnforcement)
-      LicenseAllowedForNewTrades(); // updates cached state
-}
-
-//-------------------------------------------------------------------
-// INIT / DEINIT
-//-------------------------------------------------------------------
-int OnInit()
-{
-   current_bar_time = iTime(_Symbol, PERIOD_CURRENT, 0);
-   trade_opened_this_bar = HasOpenPosition();
-
-   LoadDailyStateFromGV();
-
-   // Ensure baseline exists and reset behavior is safe
-   GetBaselineValue();
-
-   // Load + initial license check (ADD-ONLY)
-   LoadLicenseStateFromGV();
-   if(InpUseLicenseEnforcement)
-      LicenseCheckNow();
-
-   UpdateDailyStats();
-   RebuildRiskTodayClosedPLFromHistory();
-   DrawDailyHUD();
-
-   EventSetTimer(1);
-   return(INIT_SUCCEEDED);
-}
-
-void OnDeinit(const int reason)
-{
-   EventKillTimer();
-   RemoveHUD();
-}
-
-//-------------------------------------------------------------------
-// TICK
-//-------------------------------------------------------------------
-void OnTick()
-{
-   UpdateDailyStats();
-   DrawDailyHUD();
-
-   if(HasOpenPosition())
-   {
-      EnforceHardSLIfMissing();
-      ApplyTrailingStop();
-   }
-
-   // Hard blocks
-   if(CheckDailyLossLimit()) return;
-
-   // If safe/day already hit, stop for day (and close any open)
-   if(g_daily_safe_day_hit || CheckSafeDayStop())
-   {
-      if(HasOpenPosition()) CloseAllPositionsForSymbol();
-      return;
-   }
-
-   // Profit cap block (stronger than safe/day)
-   if(CheckDailyProfitCap())
-   {
-      if(HasOpenPosition()) CloseAllPositionsForSymbol();
-      return;
-   }
-
-   if(WeekendBlock()) return;
-   if(IsInRolloverBlock()) return;
-   if(IsSpreadTooHigh()) return;
-
-   datetime bar_time = iTime(_Symbol, PERIOD_CURRENT, 0);
-
-   if(bar_time != current_bar_time)
-   {
-      // Close trade at candle close (on new bar)
-      if(HasOpenPosition()) CloseAllPositionsForSymbol();
-
-      current_bar_time = bar_time;
-      trade_opened_this_bar = false;
-
-      double prev_open  = iOpen(_Symbol, PERIOD_CURRENT, 1);
-      double prev_close = iClose(_Symbol, PERIOD_CURRENT, 1);
-
-      double tol = PipSize() * 0.1;
-      if(MathAbs(prev_close - prev_open) <= tol) return;
-
-      if(HasOpenPosition()) return;
-      if(trade_opened_this_bar) return;
-
-      // LICENSE SOFT-LOCK (ADD-ONLY) => blocks NEW trades only
-      if(!LicenseAllowedForNewTrades())
-         return;
-
-      trade.SetExpertMagicNumber(InpMagicNumber);
-      trade.SetDeviationInPoints(InpSlippage);
-
-      if(prev_close > prev_open)
-      {
-         double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-         double sl = 0.0;
-         if(InpUseHardStopAtEntry && InpTrailingStopPips > 0.0)
-            sl = CalcHardSLPrice(true, ask);
-
-         if(trade.Buy(InpLots, _Symbol, ask, sl, 0.0, "CandleByCandle BUY"))
-         {
-            if(trade.ResultRetcode() == TRADE_RETCODE_DONE)
-               trade_opened_this_bar = true;
-         }
-         return;
-      }
-
-      if(prev_close < prev_open)
-      {
-         double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         double sl = 0.0;
-         if(InpUseHardStopAtEntry && InpTrailingStopPips > 0.0)
-            sl = CalcHardSLPrice(false, bid);
-
-         if(trade.Sell(InpLots, _Symbol, bid, sl, 0.0, "CandleByCandle SELL"))
-         {
-            if(trade.ResultRetcode() == TRADE_RETCODE_DONE)
-               trade_opened_this_bar = true;
-         }
-         return;
-      }
-   }
-}
-//+------------------------------------------------------------------+
+// ------------------------------
+// LISTEN
+// ------------------------------
+app.listen(PORT, () => {
+  console.log(`API listening on port ${PORT}`);
+});
