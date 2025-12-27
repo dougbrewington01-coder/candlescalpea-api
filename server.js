@@ -1,50 +1,146 @@
-// server.js
-// CandleScalpEA API (DigitalOcean) - minimal Express server with PayPal webhook endpoint
-
-const express = require("express");
+import express from "express";
+import fetch from "node-fetch";
+import crypto from "crypto";
 
 const app = express();
 
-// IMPORTANT: PayPal webhooks send JSON
-app.use(express.json({ type: "*/*" }));
+/*
+  IMPORTANT:
+  PayPal webhooks require the RAW body for signature verification
+*/
+app.use(
+  "/paypal/webhook",
+  express.raw({ type: "application/json" })
+);
 
-// --- Health check (so you can confirm the API is alive in a browser) ---
+app.use(express.json());
+
+/* =========================
+   ENVIRONMENT VARIABLES
+   ========================= */
+const {
+  PAYPAL_CLIENT_ID,
+  PAYPAL_CLIENT_SECRET,
+  PAYPAL_WEBHOOK_ID,
+  PORT = 8080
+} = process.env;
+
+/* =========================
+   BASIC HEALTH CHECK
+   ========================= */
 app.get("/", (req, res) => {
-  res.status(200).send("CandleScalpEA API is live.");
+  res.status(200).send("CandleScalpEA API is running");
 });
 
-app.get("/health", (req, res) => {
-  res.status(200).json({ ok: true, service: "candlescalpea-api" });
-});
+/* =========================
+   PAYPAL ACCESS TOKEN
+   ========================= */
+async function getPayPalAccessToken() {
+  const auth = Buffer.from(
+    `${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`
+  ).toString("base64");
 
-// --- PayPal Webhook (THIS is the endpoint you point PayPal to) ---
-// Use this URL in PayPal Webhooks:
-// https://YOUR-API-DOMAIN/api/paypal/webhook
+  const response = await fetch(
+    "https://api-m.paypal.com/v1/oauth2/token",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: "grant_type=client_credentials"
+    }
+  );
 
-// Browser-friendly check (optional but helpful)
-app.get("/api/paypal/webhook", (req, res) => {
-  res.status(200).send("OK");
-});
+  const data = await response.json();
+  return data.access_token;
+}
 
-// Real webhook receiver
-app.post("/api/paypal/webhook", (req, res) => {
+/* =========================
+   PAYPAL WEBHOOK VERIFY
+   ========================= */
+async function verifyPayPalWebhook(headers, body) {
+  const accessToken = await getPayPalAccessToken();
+
+  const response = await fetch(
+    "https://api-m.paypal.com/v1/notifications/verify-webhook-signature",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        auth_algo: headers["paypal-auth-algo"],
+        cert_url: headers["paypal-cert-url"],
+        transmission_id: headers["paypal-transmission-id"],
+        transmission_sig: headers["paypal-transmission-sig"],
+        transmission_time: headers["paypal-transmission-time"],
+        webhook_id: PAYPAL_WEBHOOK_ID,
+        webhook_event: JSON.parse(body.toString())
+      })
+    }
+  );
+
+  const data = await response.json();
+  return data.verification_status === "SUCCESS";
+}
+
+/* =========================
+   PAYPAL WEBHOOK ENDPOINT
+   ========================= */
+app.post("/paypal/webhook", async (req, res) => {
   try {
-    // Log the webhook so we know it hit your server.
-    // (Later we’ll verify signature + update your DB based on event types.)
-    console.log("✅ PayPal webhook received:");
-    console.log(JSON.stringify(req.body, null, 2));
+    const isValid = await verifyPayPalWebhook(req.headers, req.body);
 
-    // Always respond 200 quickly so PayPal marks it delivered.
-    return res.sendStatus(200);
+    if (!isValid) {
+      console.error("❌ Invalid PayPal webhook signature");
+      return res.status(400).send("Invalid webhook");
+    }
+
+    const event = JSON.parse(req.body.toString());
+
+    console.log("✅ PayPal Event:", event.event_type);
+
+    /* =========================
+       HANDLE SUBSCRIPTION EVENTS
+       ========================= */
+    switch (event.event_type) {
+      case "BILLING.SUBSCRIPTION.ACTIVATED":
+        console.log("🟢 Subscription Activated:", event.resource.id);
+        // TODO: mark user ACTIVE in DB
+        break;
+
+      case "BILLING.SUBSCRIPTION.CANCELLED":
+        console.log("🔴 Subscription Cancelled:", event.resource.id);
+        // TODO: soft-lock license
+        break;
+
+      case "BILLING.SUBSCRIPTION.SUSPENDED":
+        console.log("🟠 Subscription Suspended:", event.resource.id);
+        // TODO: soft-lock license
+        break;
+
+      case "PAYMENT.SALE.DENIED":
+      case "PAYMENT.SALE.FAILED":
+        console.log("🔴 Payment Failed");
+        // TODO: soft-lock license
+        break;
+
+      default:
+        console.log("ℹ️ Unhandled event:", event.event_type);
+    }
+
+    res.status(200).send("OK");
   } catch (err) {
-    console.error("❌ Webhook error:", err);
-    // Still return 200 to avoid PayPal retry storms while you're testing.
-    return res.sendStatus(200);
+    console.error("Webhook error:", err);
+    res.status(500).send("Server error");
   }
 });
 
-// --- Start server ---
-const PORT = process.env.PORT || 8080;
+/* =========================
+   START SERVER
+   ========================= */
 app.listen(PORT, () => {
-  console.log(`CandleScalpEA API listening on port ${PORT}`);
+  console.log(`🚀 CandleScalpEA API listening on port ${PORT}`);
 });
