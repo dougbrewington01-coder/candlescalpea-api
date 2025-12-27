@@ -1,39 +1,35 @@
 import express from "express";
 import bodyParser from "body-parser";
-import crypto from "crypto";
 import fetch from "node-fetch";
+import crypto from "crypto";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(bodyParser.json());
 
 /* ================================
    CONFIG
 ================================ */
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID;
 const PAYPAL_SECRET = process.env.PAYPAL_SECRET;
-const PAYPAL_WEBHOOK_ID = "0B073228AE592314G";
-const PAYPAL_API_BASE = "https://api-m.paypal.com";
+const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID;
+
+const PAYPAL_API = "https://api-m.paypal.com";
 
 /* ================================
-   MIDDLEWARE
+   PAYPAL AUTH
 ================================ */
-app.use(bodyParser.json({ type: "*/*" }));
-
-/* ================================
-   PAYPAL TOKEN
-================================ */
-async function getPayPalAccessToken() {
+async function getPayPalToken() {
   const auth = Buffer.from(
     `${PAYPAL_CLIENT_ID}:${PAYPAL_SECRET}`
   ).toString("base64");
 
-  const res = await fetch(`${PAYPAL_API_BASE}/v1/oauth2/token`, {
+  const res = await fetch(`${PAYPAL_API}/v1/oauth2/token`, {
     method: "POST",
     headers: {
       Authorization: `Basic ${auth}`,
-      "Content-Type": "application/x-www-form-urlencoded"
+      "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: "grant_type=client_credentials"
+    body: "grant_type=client_credentials",
   });
 
   const data = await res.json();
@@ -43,28 +39,26 @@ async function getPayPalAccessToken() {
 /* ================================
    PAYPAL WEBHOOK VERIFY
 ================================ */
-async function verifyPayPalWebhook(req) {
-  const accessToken = await getPayPalAccessToken();
-
-  const verificationPayload = {
-    auth_algo: req.headers["paypal-auth-algo"],
-    cert_url: req.headers["paypal-cert-url"],
-    transmission_id: req.headers["paypal-transmission-id"],
-    transmission_sig: req.headers["paypal-transmission-sig"],
-    transmission_time: req.headers["paypal-transmission-time"],
-    webhook_id: PAYPAL_WEBHOOK_ID,
-    webhook_event: req.body
-  };
+async function verifyWebhook(headers, body) {
+  const token = await getPayPalToken();
 
   const res = await fetch(
-    `${PAYPAL_API_BASE}/v1/notifications/verify-webhook-signature`,
+    `${PAYPAL_API}/v1/notifications/verify-webhook-signature`,
     {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json"
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
       },
-      body: JSON.stringify(verificationPayload)
+      body: JSON.stringify({
+        auth_algo: headers["paypal-auth-algo"],
+        cert_url: headers["paypal-cert-url"],
+        transmission_id: headers["paypal-transmission-id"],
+        transmission_sig: headers["paypal-transmission-sig"],
+        transmission_time: headers["paypal-transmission-time"],
+        webhook_id: PAYPAL_WEBHOOK_ID,
+        webhook_event: body,
+      }),
     }
   );
 
@@ -73,45 +67,54 @@ async function verifyPayPalWebhook(req) {
 }
 
 /* ================================
-   PAYPAL WEBHOOK ENDPOINT
+   PAYPAL WEBHOOK RECEIVER
 ================================ */
 app.post("/paypal/webhook", async (req, res) => {
-  try {
-    const verified = await verifyPayPalWebhook(req);
-    if (!verified) {
-      return res.status(400).send("Invalid webhook");
-    }
+  const verified = await verifyWebhook(req.headers, req.body);
+  if (!verified) return res.status(400).send("Invalid webhook");
 
-    const event = req.body.event_type;
-    const resource = req.body.resource;
+  const event = req.body.event_type;
+  const resource = req.body.resource;
 
-    console.log("PayPal Event:", event);
+  console.log("PayPal Event:", event);
 
-    if (event === "BILLING.SUBSCRIPTION.ACTIVATED") {
-      console.log("Subscription activated:", resource.id);
-      // TODO: mark user active
-    }
+  /*
+    EVENTS YOU CARE ABOUT:
+    - BILLING.SUBSCRIPTION.ACTIVATED
+    - BILLING.SUBSCRIPTION.CANCELLED
+    - BILLING.SUBSCRIPTION.SUSPENDED
+    - PAYMENT.SALE.COMPLETED
+  */
 
-    if (event === "BILLING.SUBSCRIPTION.CANCELLED") {
-      console.log("Subscription cancelled:", resource.id);
-      // TODO: disable user
-    }
+  // TODO: Update database here later
+  // For now, just logging
+  console.log("Subscription ID:", resource.id);
 
-    if (event === "BILLING.SUBSCRIPTION.SUSPENDED") {
-      console.log("Subscription suspended:", resource.id);
-      // TODO: suspend access
-    }
+  res.sendStatus(200);
+});
 
-    if (event === "PAYMENT.SALE.COMPLETED") {
-      console.log("Payment completed:", resource.id);
-      // TODO: log payment
-    }
+/* ================================
+   EA PHONE-HOME LICENSE CHECK
+================================ */
+app.post("/ea/check", (req, res) => {
+  const { account, nickname, symbol } = req.body;
 
-    res.sendStatus(200);
-  } catch (err) {
-    console.error("Webhook error:", err);
-    res.sendStatus(500);
+  if (!account || !nickname) {
+    return res.json({ allowed: false });
   }
+
+  /*
+    TEMP LOGIC:
+    - Replace with DB lookup later
+    - Right now: allow all valid requests
+  */
+
+  const allowed = true;
+
+  res.json({
+    allowed,
+    message: allowed ? "OK" : "LICENSE_BLOCKED",
+  });
 });
 
 /* ================================
@@ -124,6 +127,7 @@ app.get("/", (req, res) => {
 /* ================================
    START SERVER
 ================================ */
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`API running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });
