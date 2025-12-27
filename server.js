@@ -1,6 +1,6 @@
 // ==============================
-// server.js (FULL FILE - FINAL)
-// PayPal Webhooks + License Check (Clean YES/NO) + Auth (Register/Login)
+// server.js (FULL FILE - LIVE AUTH)
+// PayPal Webhooks + License Check + REAL Login/Register/Admin
 // ES Modules version
 // ==============================
 
@@ -17,15 +17,13 @@ import bcrypt from "bcryptjs";
 // ------------------------------
 const app = express();
 
-// Capture RAW body for PayPal signature verification while still using JSON everywhere.
-app.use(
-  express.json({
-    limit: "2mb",
-    verify: (req, res, buf) => {
-      req.rawBody = buf; // keep exact raw payload
-    },
-  })
-);
+// DigitalOcean App Platform runs behind a proxy (needed for secure cookies)
+app.set("trust proxy", 1);
+
+// IMPORTANT:
+// - PayPal webhook MUST receive RAW body for signature verification.
+// - Everything else uses normal JSON.
+app.use(express.json({ limit: "1mb" }));
 
 // ------------------------------
 // ENV / CONFIG
@@ -44,21 +42,40 @@ const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || "";
 // CSEA_API_KEY=some-long-random
 const CSEA_API_KEY = process.env.CSEA_API_KEY || "";
 
-// Sessions
+// REQUIRED for login sessions:
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 if (!SESSION_SECRET) {
-  console.warn("WARNING: SESSION_SECRET is not set. Auth will not be secure.");
+  console.warn("WARNING: SESSION_SECRET is missing. Add it in DigitalOcean env vars.");
 }
 
-// Admin login (for later admin package)
+// Admin identity (your email). Add this env var in DO:
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
 
 // Live vs Sandbox
 const PAYPAL_BASE =
   process.env.PAYPAL_ENV === "sandbox"
     ? "https://api-m.sandbox.paypal.com"
     : "https://api-m.paypal.com";
+
+// ------------------------------
+// SESSION (REAL LOGIN)
+// ------------------------------
+app.use(
+  session({
+    name: "csea_sid",
+    secret: SESSION_SECRET || "dev-only-secret-change-me",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      // secure cookie only when on HTTPS (DigitalOcean is HTTPS)
+      secure: true,
+      // 7 days
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    },
+  })
+);
 
 // ------------------------------
 // SIMPLE JSON "DB"
@@ -69,18 +86,18 @@ const USERS_FILE = path.join(DATA_DIR, "users.json");
 // users.json example shape:
 // [
 //   {
-//     "id": "u_...",
 //     "email": "user@email.com",
 //     "password_hash": "...",
-//     "email_verified": true,
+//     "email_verified": false,
+//     "email_verify_token": "...",
 //     "subscription_status": "active",   // active | past_due | canceled | locked
 //     "paypal_subscription_id": "I-XXXX",
 //     "paypal_payer_id": "XXXX",
 //     "nickname": "Domino",              // CASE-SENSITIVE
 //     "mt5_account": "12345678",         // optional bind
 //     "promo_used": "",
-//     "created_at": "...",
-//     "updated_at": "..."
+//     "created_at": "2025-12-27T00:00:00Z",
+//     "updated_at": "2025-12-27T00:00:00Z"
 //   }
 // ]
 
@@ -107,35 +124,6 @@ function nowISO() {
   return new Date().toISOString();
 }
 
-function makeId(prefix = "u_") {
-  return (
-    prefix +
-    crypto.randomBytes(12).toString("hex") +
-    "_" +
-    Date.now().toString(36)
-  );
-}
-
-// ------------------------------
-// SESSIONS
-// ------------------------------
-app.set("trust proxy", 1);
-
-app.use(
-  session({
-    name: "csea_sid",
-    secret: SESSION_SECRET || "dev-insecure-secret",
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production", // DigitalOcean uses HTTPS in prod
-      maxAge: 1000 * 60 * 60 * 24 * 14, // 14 days
-    },
-  })
-);
-
 // ------------------------------
 // HELPERS
 // ------------------------------
@@ -147,14 +135,12 @@ function isDigits(v) {
   return /^[0-9]+$/.test(v);
 }
 
-function sendOk(res) {
-  return res.status(200).json({ ok: true });
+function sendOk(res, extra = {}) {
+  return res.status(200).json({ ok: true, ...extra });
 }
 
-function sendNo(res, reason = "not_allowed") {
-  return res
-    .status(200)
-    .json({ ok: false, reason: String(reason || "not_allowed") });
+function sendNo(res, reason = "not_allowed", code = 200) {
+  return res.status(code).json({ ok: false, reason: String(reason || "not_allowed") });
 }
 
 // OPTIONAL: protect endpoints with API key (timing-safe)
@@ -166,112 +152,26 @@ function checkApiKey(req) {
   return crypto.timingSafeEqual(Buffer.from(got), Buffer.from(CSEA_API_KEY));
 }
 
-function safeUserPublic(u) {
-  if (!u) return null;
-  const status = normStr(u.subscription_status).toLowerCase();
-  return {
-    email: u.email,
-    email_verified: u.email_verified !== false,
-    subscription_active: status === "active",
-    subscription_status: status || "inactive",
-    nickname: u.nickname || "",
-    mt5_account: u.mt5_account || "",
-    license_active:
-      (u.email_verified !== false) && status === "active" ? true : false,
-  };
+function safeEmail(email) {
+  const e = normStr(email).toLowerCase();
+  return e;
 }
 
-function requireUser(req, res, next) {
-  const userId = req.session?.userId;
-  if (!userId) return res.status(401).json({ ok: false, reason: "not_logged_in" });
-  const users = readUsers();
-  const user = users.find((x) => x.id === userId);
-  if (!user) return res.status(401).json({ ok: false, reason: "not_logged_in" });
-  req._users = users;
-  req._user = user;
+// ------------------------------
+// AUTH HELPERS
+// ------------------------------
+function requireLogin(req, res, next) {
+  if (!req.session?.userEmail) return sendNo(res, "not_logged_in", 401);
   next();
 }
 
-// ------------------------------
-// AUTH ROUTES (HOMEPAGE PACKAGE)
-// ------------------------------
-app.post("/api/auth/register", async (req, res) => {
-  try {
-    const email = normStr(req.body?.email).toLowerCase();
-    const password = normStr(req.body?.password);
-    const confirm = normStr(req.body?.confirm_password);
-
-    if (!email || !email.includes("@")) return sendNo(res, "bad_email");
-    if (!password || password.length < 8) return sendNo(res, "password_too_short");
-    if (password !== confirm) return sendNo(res, "passwords_do_not_match");
-
-    const users = readUsers();
-    const exists = users.find((u) => normStr(u.email).toLowerCase() === email);
-    if (exists) return sendNo(res, "email_already_registered");
-
-    const password_hash = await bcrypt.hash(password, 12);
-
-    const user = {
-      id: makeId("u_"),
-      email,
-      password_hash,
-      // NOTE: We can add real email verification later.
-      // For now this is live & usable (not demo).
-      email_verified: true,
-      subscription_status: "canceled", // not active until PayPal activates or you set it
-      paypal_subscription_id: "",
-      paypal_payer_id: "",
-      nickname: "",
-      mt5_account: "",
-      promo_used: "",
-      created_at: nowISO(),
-      updated_at: nowISO(),
-    };
-
-    users.push(user);
-    writeUsers(users);
-
-    req.session.userId = user.id;
-    return res.status(200).json({ ok: true });
-  } catch {
-    return sendNo(res, "server_error");
-  }
-});
-
-app.post("/api/auth/login", async (req, res) => {
-  try {
-    const email = normStr(req.body?.email).toLowerCase();
-    const password = normStr(req.body?.password);
-
-    if (!email || !password) return sendNo(res, "missing_email_or_password");
-
-    const users = readUsers();
-    const user = users.find((u) => normStr(u.email).toLowerCase() === email);
-    if (!user || !user.password_hash) return sendNo(res, "bad_login");
-
-    const ok = await bcrypt.compare(password, user.password_hash);
-    if (!ok) return sendNo(res, "bad_login");
-
-    req.session.userId = user.id;
-    return sendOk(res);
-  } catch {
-    return sendNo(res, "server_error");
-  }
-});
-
-app.post("/api/auth/logout", (req, res) => {
-  try {
-    req.session?.destroy(() => {
-      res.status(200).json({ ok: true });
-    });
-  } catch {
-    return sendNo(res, "server_error");
-  }
-});
-
-app.get("/api/me", requireUser, (req, res) => {
-  return res.status(200).json({ ok: true, ...safeUserPublic(req._user) });
-});
+function requireAdmin(req, res, next) {
+  const e = (req.session?.userEmail || "").toLowerCase();
+  if (!e) return sendNo(res, "not_logged_in", 401);
+  if (!ADMIN_EMAIL) return sendNo(res, "admin_not_configured", 403);
+  if (e !== ADMIN_EMAIL) return sendNo(res, "not_admin", 403);
+  next();
+}
 
 // ------------------------------
 // PAYPAL API HELPERS (NO SDK)
@@ -346,6 +246,11 @@ function getUserBySubscriptionId(users, subId) {
   return users.find((u) => normStr(u.paypal_subscription_id) === id) || null;
 }
 
+function getUserByEmail(users, email) {
+  const e = safeEmail(email);
+  return users.find((u) => safeEmail(u.email) === e) || null;
+}
+
 // ------------------------------
 // LICENSE DECISION (CLEAN YES/NO)
 // ------------------------------
@@ -375,6 +280,256 @@ function bindMt5IfNeeded(users, user, mt5Account) {
     writeUsers(users);
   }
 }
+
+// ------------------------------
+// AUTH ROUTES (REAL)
+// ------------------------------
+app.post("/api/register", async (req, res) => {
+  try {
+    const email = safeEmail(req.body?.email);
+    const password = normStr(req.body?.password);
+    const confirm = normStr(req.body?.confirm_password ?? req.body?.confirmPassword ?? "");
+
+    if (!email || !email.includes("@")) return sendNo(res, "bad_email", 400);
+    if (!password || password.length < 8) return sendNo(res, "password_too_short", 400);
+    if (!confirm || confirm !== password) return sendNo(res, "passwords_do_not_match", 400);
+
+    const users = readUsers();
+    if (getUserByEmail(users, email)) return sendNo(res, "email_exists", 409);
+
+    const password_hash = await bcrypt.hash(password, 12);
+    const email_verify_token = crypto.randomBytes(24).toString("hex");
+
+    const user = {
+      email,
+      password_hash,
+      email_verified: false,
+      email_verify_token,
+      subscription_status: "active", // you can default to active for now (you can change later via PayPal webhook)
+      paypal_subscription_id: "",
+      paypal_payer_id: "",
+      nickname: "",
+      mt5_account: "",
+      promo_used: "",
+      created_at: nowISO(),
+      updated_at: nowISO(),
+    };
+
+    users.push(user);
+    writeUsers(users);
+
+    // Create session immediately (user is logged in)
+    req.session.userEmail = email;
+
+    // No email service wired yet -> return verification link to show on screen
+    return sendOk(res, {
+      message: "registered",
+      verify_url: `/api/verify-email?email=${encodeURIComponent(email)}&token=${encodeURIComponent(email_verify_token)}`,
+    });
+  } catch {
+    return sendNo(res, "server_error", 500);
+  }
+});
+
+app.get("/api/verify-email", (req, res) => {
+  try {
+    const email = safeEmail(req.query?.email);
+    const token = normStr(req.query?.token);
+
+    if (!email || !token) return res.status(400).send("Missing email or token.");
+
+    const users = readUsers();
+    const user = getUserByEmail(users, email);
+    if (!user) return res.status(404).send("User not found.");
+
+    if (user.email_verified) return res.status(200).send("Email already verified.");
+
+    if (user.email_verify_token !== token) return res.status(403).send("Invalid token.");
+
+    user.email_verified = true;
+    user.email_verify_token = "";
+    user.updated_at = nowISO();
+    writeUsers(users);
+
+    return res.status(200).send("Email verified. You can go back to the site and log in.");
+  } catch {
+    return res.status(500).send("Server error.");
+  }
+});
+
+app.post("/api/login", async (req, res) => {
+  try {
+    const email = safeEmail(req.body?.email);
+    const password = normStr(req.body?.password);
+
+    if (!email || !password) return sendNo(res, "missing_email_or_password", 400);
+
+    const users = readUsers();
+    const user = getUserByEmail(users, email);
+    if (!user) return sendNo(res, "bad_login", 401);
+
+    const ok = await bcrypt.compare(password, user.password_hash || "");
+    if (!ok) return sendNo(res, "bad_login", 401);
+
+    req.session.userEmail = user.email;
+
+    return sendOk(res, { message: "logged_in" });
+  } catch {
+    return sendNo(res, "server_error", 500);
+  }
+});
+
+app.post("/api/logout", (req, res) => {
+  try {
+    req.session.destroy(() => sendOk(res, { message: "logged_out" }));
+  } catch {
+    return sendNo(res, "server_error", 500);
+  }
+});
+
+app.get("/api/me", requireLogin, (req, res) => {
+  const users = readUsers();
+  const user = getUserByEmail(users, req.session.userEmail);
+  if (!user) return sendNo(res, "user_not_found", 404);
+
+  const status = normStr(user.subscription_status).toLowerCase();
+  const subscription_active = status === "active";
+  const license_active = user.email_verified && subscription_active && status !== "locked";
+
+  return res.status(200).json({
+    ok: true,
+    email: user.email,
+    email_verified: !!user.email_verified,
+    subscription_active,
+    subscription_status: user.subscription_status,
+    license_active,
+    mt5_account: user.mt5_account || "",
+    nickname: user.nickname || "",
+  });
+});
+
+// Customer saves MT5 + nickname (requires login)
+app.post("/api/mt5/bind", requireLogin, (req, res) => {
+  try {
+    const mt5 = normStr(req.body?.mt5);
+    const nickname = normStr(req.body?.nickname);
+
+    if (!mt5 || !isDigits(mt5)) return sendNo(res, "bad_mt5", 400);
+    if (!nickname) return sendNo(res, "missing_nickname", 400);
+
+    const users = readUsers();
+    const user = getUserByEmail(users, req.session.userEmail);
+    if (!user) return sendNo(res, "user_not_found", 404);
+
+    // If already bound to a different MT5, block (admin can clear it)
+    if (user.mt5_account && String(user.mt5_account) !== String(mt5)) {
+      return sendNo(res, "mt5_already_bound", 403);
+    }
+
+    user.mt5_account = String(mt5);
+    user.nickname = nickname; // case-sensitive
+    user.updated_at = nowISO();
+    writeUsers(users);
+
+    return sendOk(res);
+  } catch {
+    return sendNo(res, "server_error", 500);
+  }
+});
+
+// Download endpoint (requires verified + active)
+app.get("/api/download", requireLogin, (req, res) => {
+  const users = readUsers();
+  const user = getUserByEmail(users, req.session.userEmail);
+  if (!user) return sendNo(res, "user_not_found", 404);
+
+  const status = normStr(user.subscription_status).toLowerCase();
+  if (!user.email_verified) return sendNo(res, "email_unverified", 403);
+  if (status !== "active") return sendNo(res, "subscription_inactive", 403);
+
+  // You can swap this later to a real file download (S3/GitHub release/etc.)
+  return res.status(200).send("Download endpoint is live. Wire to your EA file next.");
+});
+
+// ------------------------------
+// ADMIN ROUTES (REAL)
+// ------------------------------
+app.get("/api/admin/me", requireAdmin, (req, res) => {
+  return sendOk(res, { admin: true, email: req.session.userEmail });
+});
+
+app.get("/api/admin/users", requireAdmin, (req, res) => {
+  const users = readUsers().map(u => ({
+    email: u.email,
+    email_verified: !!u.email_verified,
+    subscription_status: u.subscription_status,
+    mt5_account: u.mt5_account || "",
+    nickname: u.nickname || "",
+    promo_used: u.promo_used || "",
+    created_at: u.created_at,
+    updated_at: u.updated_at,
+  }));
+  return sendOk(res, { users });
+});
+
+app.post("/api/admin/users/delete", requireAdmin, (req, res) => {
+  try {
+    const email = safeEmail(req.body?.email);
+    if (!email) return sendNo(res, "missing_email", 400);
+
+    const users = readUsers();
+    const before = users.length;
+    const afterUsers = users.filter(u => safeEmail(u.email) !== email);
+
+    if (afterUsers.length === before) return sendNo(res, "not_found", 404);
+
+    writeUsers(afterUsers);
+    return sendOk(res);
+  } catch {
+    return sendNo(res, "server_error", 500);
+  }
+});
+
+app.post("/api/admin/clear-mt5", requireAdmin, (req, res) => {
+  try {
+    const email = safeEmail(req.body?.email);
+    if (!email) return sendNo(res, "missing_email", 400);
+
+    const users = readUsers();
+    const user = getUserByEmail(users, email);
+    if (!user) return sendNo(res, "not_found", 404);
+
+    user.mt5_account = "";
+    user.updated_at = nowISO();
+    writeUsers(users);
+
+    return sendOk(res);
+  } catch {
+    return sendNo(res, "server_error", 500);
+  }
+});
+
+app.post("/api/admin/set-status", requireAdmin, (req, res) => {
+  try {
+    const email = safeEmail(req.body?.email);
+    const status = normStr(req.body?.status).toLowerCase();
+    const allowed = ["active", "past_due", "canceled", "locked"];
+    if (!email) return sendNo(res, "missing_email", 400);
+    if (!allowed.includes(status)) return sendNo(res, "bad_status", 400);
+
+    const users = readUsers();
+    const user = getUserByEmail(users, email);
+    if (!user) return sendNo(res, "not_found", 404);
+
+    user.subscription_status = status;
+    user.updated_at = nowISO();
+    writeUsers(users);
+
+    return sendOk(res);
+  } catch {
+    return sendNo(res, "server_error", 500);
+  }
+});
 
 // ------------------------------
 // LICENSE CHECK ROUTES (EA calls these)
@@ -422,18 +577,20 @@ app.get("/license", licenseCheckHandler);
 app.get("/api/license", licenseCheckHandler);
 
 // ------------------------------
-// PAYPAL WEBHOOK (VERIFY)
+// PAYPAL WEBHOOK (RAW BODY + VERIFY)
 // ------------------------------
-app.post("/paypal/webhook", async (req, res) => {
+app.post("/paypal/webhook", express.raw({ type: "*/*", limit: "2mb" }), async (req, res) => {
   try {
-    const rawBody = req.rawBody ? req.rawBody.toString("utf8") : "";
+    const rawBody = req.body ? req.body.toString("utf8") : "";
 
+    // Verify signature (PRODUCTION SAFE)
     const verified = await paypalVerifyWebhookSignature({
       headers: req.headers,
       rawBody,
     });
 
     if (!verified) {
+      // return 200 so PayPal doesn't hammer retries
       return res.status(200).json({ ok: false, reason: "webhook_not_verified" });
     }
 
@@ -451,8 +608,10 @@ app.post("/paypal/webhook", async (req, res) => {
     const users = readUsers();
     const user = subscriptionId ? getUserBySubscriptionId(users, subscriptionId) : null;
 
+    // If we can’t map it, just acknowledge
     if (!user) return res.status(200).json({ ok: true, note: "no_user_match" });
 
+    // Map PayPal event -> your subscription_status
     if (eventType === "BILLING.SUBSCRIPTION.ACTIVATED") {
       user.subscription_status = "active";
       user.updated_at = nowISO();
@@ -474,6 +633,7 @@ app.post("/paypal/webhook", async (req, res) => {
       writeUsers(users);
     }
 
+    // Optional: payment completion can mark active (unless locked)
     if (eventType === "PAYMENT.CAPTURE.COMPLETED" || eventType === "PAYMENT.SALE.COMPLETED") {
       if (normStr(user.subscription_status).toLowerCase() !== "locked") {
         user.subscription_status = "active";
@@ -484,12 +644,13 @@ app.post("/paypal/webhook", async (req, res) => {
 
     return res.status(200).json({ ok: true });
   } catch {
+    // Always 200 to stop retry storms
     return res.status(200).json({ ok: false, reason: "webhook_error" });
   }
 });
 
 // ------------------------------
-// ADMIN-HELPER ENDPOINTS (OPTIONAL)
+// ADMIN-HELPER ENDPOINTS (OPTIONAL - KEEPING YOURS)
 // ------------------------------
 app.post("/admin/dev-upsert-user", (req, res) => {
   try {
@@ -508,10 +669,10 @@ app.post("/admin/dev-upsert-user", (req, res) => {
 
     if (!user) {
       user = {
-        id: makeId("u_"),
         email,
-        password_hash: "",
+        password_hash: "", // (if created by this dev route)
         email_verified,
+        email_verify_token: "",
         subscription_status: normStr(body.subscription_status) || "active",
         paypal_subscription_id: paypal_subscription_id || "",
         paypal_payer_id: normStr(body.paypal_payer_id) || "",
