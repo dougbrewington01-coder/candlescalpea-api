@@ -23,7 +23,7 @@ app.use(express.json({ limit: "1mb" }));
 // ------------------------------
 // ENV / CONFIG
 // ------------------------------
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 
 // REQUIRED (set in your App Platform env vars):
 // PAYPAL_CLIENT_ID=...
@@ -405,6 +405,6 @@ app.get("/health", (req, res) => {
 // ------------------------------
 // LISTEN
 // ------------------------------
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0');
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server listening on port ${PORT}`);
 });
