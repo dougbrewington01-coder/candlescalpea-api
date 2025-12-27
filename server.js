@@ -397,6 +397,11 @@ app.get("/admin/dev-users", (req, res) => {
 app.get("/", (req, res) => res.status(200).send("CandleScalpEA API is running."));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
+// HEALTH CHECK
+app.get("/health", (req, res) => {
+  res.status(200).json({ ok: true });
+});
+
 // ------------------------------
 // LISTEN
 // ------------------------------
