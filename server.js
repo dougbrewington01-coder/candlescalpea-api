@@ -69,10 +69,8 @@ app.use(
     cookie: {
       httpOnly: true,
       sameSite: "lax",
-      // secure cookie only when on HTTPS (DigitalOcean is HTTPS)
       secure: true,
-      // 7 days
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
     },
   })
 );
@@ -82,24 +80,6 @@ app.use(
 // ------------------------------
 const DATA_DIR = path.join(process.cwd(), "data");
 const USERS_FILE = path.join(DATA_DIR, "users.json");
-
-// users.json example shape:
-// [
-//   {
-//     "email": "user@email.com",
-//     "password_hash": "...",
-//     "email_verified": false,
-//     "email_verify_token": "...",
-//     "subscription_status": "active",   // active | past_due | canceled | locked
-//     "paypal_subscription_id": "I-XXXX",
-//     "paypal_payer_id": "XXXX",
-//     "nickname": "Domino",              // CASE-SENSITIVE
-//     "mt5_account": "12345678",         // optional bind
-//     "promo_used": "",
-//     "created_at": "2025-12-27T00:00:00Z",
-//     "updated_at": "2025-12-27T00:00:00Z"
-//   }
-// ]
 
 function ensureDataStore() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -153,8 +133,7 @@ function checkApiKey(req) {
 }
 
 function safeEmail(email) {
-  const e = normStr(email).toLowerCase();
-  return e;
+  return normStr(email).toLowerCase();
 }
 
 // ------------------------------
@@ -305,7 +284,7 @@ app.post("/api/register", async (req, res) => {
       password_hash,
       email_verified: false,
       email_verify_token,
-      subscription_status: "active", // you can default to active for now (you can change later via PayPal webhook)
+      subscription_status: "inactive", // IMPORTANT: PayPal/webhook/admin sets to active
       paypal_subscription_id: "",
       paypal_payer_id: "",
       nickname: "",
@@ -405,7 +384,31 @@ app.get("/api/me", requireLogin, (req, res) => {
     license_active,
     mt5_account: user.mt5_account || "",
     nickname: user.nickname || "",
+    paypal_subscription_id: user.paypal_subscription_id || "",
   });
+});
+
+// ------------------------------
+// *** MISSING PIECE: LINK PAYPAL SUBSCRIPTION ID TO USER ***
+// This is what makes webhook matching possible.
+// ------------------------------
+app.post("/api/paypal/link-subscription", requireLogin, (req, res) => {
+  try {
+    const subId = normStr(req.body?.subscriptionID || req.body?.subscription_id || "");
+    if (!subId) return sendNo(res, "missing_subscription_id", 400);
+
+    const users = readUsers();
+    const user = getUserByEmail(users, req.session.userEmail);
+    if (!user) return sendNo(res, "user_not_found", 404);
+
+    user.paypal_subscription_id = subId;
+    user.updated_at = nowISO();
+    writeUsers(users);
+
+    return sendOk(res, { message: "subscription_linked" });
+  } catch {
+    return sendNo(res, "server_error", 500);
+  }
 });
 
 // Customer saves MT5 + nickname (requires login)
@@ -459,12 +462,13 @@ app.get("/api/admin/me", requireAdmin, (req, res) => {
 });
 
 app.get("/api/admin/users", requireAdmin, (req, res) => {
-  const users = readUsers().map(u => ({
+  const users = readUsers().map((u) => ({
     email: u.email,
     email_verified: !!u.email_verified,
     subscription_status: u.subscription_status,
     mt5_account: u.mt5_account || "",
     nickname: u.nickname || "",
+    paypal_subscription_id: u.paypal_subscription_id || "",
     promo_used: u.promo_used || "",
     created_at: u.created_at,
     updated_at: u.updated_at,
@@ -479,7 +483,7 @@ app.post("/api/admin/users/delete", requireAdmin, (req, res) => {
 
     const users = readUsers();
     const before = users.length;
-    const afterUsers = users.filter(u => safeEmail(u.email) !== email);
+    const afterUsers = users.filter((u) => safeEmail(u.email) !== email);
 
     if (afterUsers.length === before) return sendNo(res, "not_found", 404);
 
@@ -513,7 +517,8 @@ app.post("/api/admin/set-status", requireAdmin, (req, res) => {
   try {
     const email = safeEmail(req.body?.email);
     const status = normStr(req.body?.status).toLowerCase();
-    const allowed = ["active", "past_due", "canceled", "locked"];
+    const allowed = ["active", "inactive", "past_due", "canceled", "locked"];
+
     if (!email) return sendNo(res, "missing_email", 400);
     if (!allowed.includes(status)) return sendNo(res, "bad_status", 400);
 
@@ -583,14 +588,12 @@ app.post("/paypal/webhook", express.raw({ type: "*/*", limit: "2mb" }), async (r
   try {
     const rawBody = req.body ? req.body.toString("utf8") : "";
 
-    // Verify signature (PRODUCTION SAFE)
     const verified = await paypalVerifyWebhookSignature({
       headers: req.headers,
       rawBody,
     });
 
     if (!verified) {
-      // return 200 so PayPal doesn't hammer retries
       return res.status(200).json({ ok: false, reason: "webhook_not_verified" });
     }
 
@@ -608,10 +611,8 @@ app.post("/paypal/webhook", express.raw({ type: "*/*", limit: "2mb" }), async (r
     const users = readUsers();
     const user = subscriptionId ? getUserBySubscriptionId(users, subscriptionId) : null;
 
-    // If we can’t map it, just acknowledge
     if (!user) return res.status(200).json({ ok: true, note: "no_user_match" });
 
-    // Map PayPal event -> your subscription_status
     if (eventType === "BILLING.SUBSCRIPTION.ACTIVATED") {
       user.subscription_status = "active";
       user.updated_at = nowISO();
@@ -644,65 +645,8 @@ app.post("/paypal/webhook", express.raw({ type: "*/*", limit: "2mb" }), async (r
 
     return res.status(200).json({ ok: true });
   } catch {
-    // Always 200 to stop retry storms
     return res.status(200).json({ ok: false, reason: "webhook_error" });
   }
-});
-
-// ------------------------------
-// ADMIN-HELPER ENDPOINTS (OPTIONAL - KEEPING YOURS)
-// ------------------------------
-app.post("/admin/dev-upsert-user", (req, res) => {
-  try {
-    const body = req.body || {};
-    const email = normStr(body.email);
-    const nickname = body.nickname; // KEEP CASE-SENSITIVE as given
-    const paypal_subscription_id = normStr(body.paypal_subscription_id);
-    const email_verified = !!body.email_verified;
-
-    if (!email || !nickname) {
-      return res.status(200).json({ ok: false, reason: "missing_email_or_nickname" });
-    }
-
-    const users = readUsers();
-    let user = users.find((u) => normStr(u.email).toLowerCase() === email.toLowerCase());
-
-    if (!user) {
-      user = {
-        email,
-        password_hash: "", // (if created by this dev route)
-        email_verified,
-        email_verify_token: "",
-        subscription_status: normStr(body.subscription_status) || "active",
-        paypal_subscription_id: paypal_subscription_id || "",
-        paypal_payer_id: normStr(body.paypal_payer_id) || "",
-        nickname,
-        mt5_account: normStr(body.mt5_account) || "",
-        promo_used: normStr(body.promo_used) || "",
-        created_at: nowISO(),
-        updated_at: nowISO(),
-      };
-      users.push(user);
-    } else {
-      user.email = email;
-      user.nickname = nickname;
-      if (paypal_subscription_id) user.paypal_subscription_id = paypal_subscription_id;
-      user.email_verified = email_verified;
-      if (body.subscription_status) user.subscription_status = normStr(body.subscription_status);
-      if (body.mt5_account !== undefined) user.mt5_account = normStr(body.mt5_account);
-      user.updated_at = nowISO();
-    }
-
-    writeUsers(users);
-    return res.status(200).json({ ok: true });
-  } catch {
-    return res.status(200).json({ ok: false, reason: "server_error" });
-  }
-});
-
-app.get("/admin/dev-users", (req, res) => {
-  const users = readUsers();
-  return res.status(200).json({ ok: true, users });
 });
 
 // ------------------------------
