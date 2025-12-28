@@ -23,6 +23,22 @@ app.set("trust proxy", 1);
 // - Everything else uses normal JSON.
 app.use(express.json({ limit: "1mb" }));
 
+// ✅ CORS (FIX for Register/Login from https://candlescalpea.com)
+// If your static site is on candlescalpea.com and API is on a different domain,
+// the browser will BLOCK requests unless we allow it here.
+const SITE_ORIGIN = (process.env.SITE_ORIGIN || "https://candlescalpea.com").trim();
+
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", SITE_ORIGIN);
+  res.header("Vary", "Origin");
+  res.header("Access-Control-Allow-Credentials", "true");
+  res.header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With, x-csea-key");
+
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 // ------------------------------
 // ENV / CONFIG
 // ------------------------------
@@ -62,7 +78,8 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      sameSite: "lax",
+      // ✅ FIX: cross-domain cookies require SameSite=None
+      sameSite: "none",
       secure: FORCE_SECURE_COOKIE, // DO = true, local testing can set FORCE_SECURE_COOKIE=false
       maxAge: 7 * 24 * 60 * 60 * 1000,
     },
@@ -174,8 +191,9 @@ function sendNo(res, reason = "not_allowed", code = 200) {
   return res.status(code).json({ ok: false, reason: String(reason || "not_allowed") });
 }
 
+// OPTIONAL: protect endpoints with API key (timing-safe)
 function checkApiKey(req) {
-  if (!CSEA_API_KEY) return true;
+  if (!CSEA_API_KEY) return true; // if not set, skip enforcement
   const got = (req.headers["x-csea-key"] || "").toString().trim();
   if (!got) return false;
   if (got.length !== CSEA_API_KEY.length) return false;
