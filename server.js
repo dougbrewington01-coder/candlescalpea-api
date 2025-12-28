@@ -655,6 +655,28 @@ app.post("/paypal/webhook", express.raw({ type: "*/*", limit: "2mb" }), async (r
 app.get("/", (req, res) => res.status(200).send("CandleScalpEA API is running."));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
+// Save PayPal subscription ID to the currently logged-in user
+app.post("/api/paypal/link-subscription", requireLogin, (req, res) => {
+  try {
+    const subscription_id = normStr(req.body?.subscription_id || req.body?.subscriptionID);
+    if (!subscription_id) return sendNo(res, "missing_subscription_id", 400);
+
+    const users = readUsers();
+    const user = getUserByEmail(users, req.session.userEmail);
+    if (!user) return sendNo(res, "user_not_found", 404);
+
+    user.paypal_subscription_id = subscription_id;
+    // keep status as-is; webhook will update to active/past_due/canceled
+    user.updated_at = nowISO();
+    writeUsers(users);
+
+    return sendOk(res, { linked: true });
+  } catch {
+    return sendNo(res, "server_error", 500);
+  }
+});
+
+
 // ------------------------------
 // LISTEN
 // ------------------------------
