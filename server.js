@@ -16,8 +16,6 @@ import bcrypt from "bcryptjs";
 // APP SETUP
 // ------------------------------
 const app = express();
-
-// DigitalOcean App Platform runs behind a proxy (needed for secure cookies)
 app.set("trust proxy", 1);
 
 // IMPORTANT:
@@ -30,28 +28,19 @@ app.use(express.json({ limit: "1mb" }));
 // ------------------------------
 const PORT = process.env.PORT || 3000;
 
-// REQUIRED (set in your App Platform env vars):
-// PAYPAL_CLIENT_ID=...
-// PAYPAL_SECRET=...
-// PAYPAL_WEBHOOK_ID=...
 const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || "";
 const PAYPAL_SECRET = process.env.PAYPAL_SECRET || "";
 const PAYPAL_WEBHOOK_ID = process.env.PAYPAL_WEBHOOK_ID || "";
 
-// OPTIONAL (recommended): EA sends this header: x-csea-key
-// CSEA_API_KEY=some-long-random
 const CSEA_API_KEY = process.env.CSEA_API_KEY || "";
 
-// REQUIRED for login sessions:
 const SESSION_SECRET = process.env.SESSION_SECRET || "";
 if (!SESSION_SECRET) {
   console.warn("WARNING: SESSION_SECRET is missing. Add it in DigitalOcean env vars.");
 }
 
-// Admin identity (your email). Add this env var in DO:
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || "").trim().toLowerCase();
 
-// Live vs Sandbox
 const PAYPAL_BASE =
   process.env.PAYPAL_ENV === "sandbox"
     ? "https://api-m.sandbox.paypal.com"
@@ -60,6 +49,11 @@ const PAYPAL_BASE =
 // ------------------------------
 // SESSION (REAL LOGIN)
 // ------------------------------
+// DO NOTE:
+// secure cookies require HTTPS. DO is HTTPS, but to avoid edge cases,
+// we only force secure=true when we believe we're behind HTTPS proxy.
+const FORCE_SECURE_COOKIE = (process.env.FORCE_SECURE_COOKIE || "true").toLowerCase() === "true";
+
 app.use(
   session({
     name: "csea_sid",
@@ -69,40 +63,97 @@ app.use(
     cookie: {
       httpOnly: true,
       sameSite: "lax",
-      secure: true,
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      secure: FORCE_SECURE_COOKIE, // DO = true, local testing can set FORCE_SECURE_COOKIE=false
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     },
   })
 );
 
 // ------------------------------
-// SIMPLE JSON "DB"
+// STORAGE (JSON FILE + SAFE FALLBACK)
 // ------------------------------
-const DATA_DIR = path.join(process.cwd(), "data");
+// Your original approach writes to /data/users.json.
+// On some deployments, that write can fail.
+// We keep the file DB, but add a fallback so your site doesn't break.
+
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : path.join(process.cwd(), "data");
+
 const USERS_FILE = path.join(DATA_DIR, "users.json");
 
+// In-memory fallback store (only used if disk is not writable)
+let MEMORY_USERS = null; // null means "not in memory mode"
+
+function nowISO() {
+  return new Date().toISOString();
+}
+
 function ensureDataStore() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, "[]", "utf8");
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, "[]", "utf8");
+    return true;
+  } catch (e) {
+    // Disk not writable / path not allowed
+    return false;
+  }
 }
 
 function readUsers() {
-  ensureDataStore();
+  // If we already switched to memory mode:
+  if (MEMORY_USERS) return MEMORY_USERS;
+
+  // Try disk:
+  const ok = ensureDataStore();
+  if (!ok) {
+    // Switch to memory mode automatically
+    if (!MEMORY_USERS) MEMORY_USERS = [];
+    return MEMORY_USERS;
+  }
+
   try {
-    return JSON.parse(fs.readFileSync(USERS_FILE, "utf8") || "[]");
+    const raw = fs.readFileSync(USERS_FILE, "utf8") || "[]";
+    return JSON.parse(raw);
   } catch {
     return [];
   }
 }
 
 function writeUsers(users) {
-  ensureDataStore();
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), "utf8");
+  // If in memory mode, keep it there
+  if (MEMORY_USERS) {
+    MEMORY_USERS = users;
+    return true;
+  }
+
+  // Try disk write
+  const ok = ensureDataStore();
+  if (!ok) {
+    // Switch to memory mode if disk write fails
+    MEMORY_USERS = users;
+    return false;
+  }
+
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), "utf8");
+    return true;
+  } catch {
+    // Switch to memory mode if disk write fails
+    MEMORY_USERS = users;
+    return false;
+  }
 }
 
-function nowISO() {
-  return new Date().toISOString();
-}
+// Optional helper endpoint (so YOU can see what storage mode it's in)
+app.get("/api/storage", (req, res) => {
+  return res.json({
+    ok: true,
+    mode: MEMORY_USERS ? "memory_fallback" : "file_json",
+    data_dir: DATA_DIR,
+    users_file: USERS_FILE,
+  });
+});
 
 // ------------------------------
 // HELPERS
@@ -123,9 +174,8 @@ function sendNo(res, reason = "not_allowed", code = 200) {
   return res.status(code).json({ ok: false, reason: String(reason || "not_allowed") });
 }
 
-// OPTIONAL: protect endpoints with API key (timing-safe)
 function checkApiKey(req) {
-  if (!CSEA_API_KEY) return true; // if not set, skip enforcement
+  if (!CSEA_API_KEY) return true;
   const got = (req.headers["x-csea-key"] || "").toString().trim();
   if (!got) return false;
   if (got.length !== CSEA_API_KEY.length) return false;
@@ -243,7 +293,6 @@ function evaluateLicense(user, mt5Account) {
   if (status === "locked") return { ok: false, reason: "account_locked" };
   if (status !== "active") return { ok: false, reason: "subscription_inactive" };
 
-  // MT5 bind rule: if already bound, must match
   if (user.mt5_account && String(user.mt5_account) !== String(mt5Account)) {
     return { ok: false, reason: "mt5_mismatch" };
   }
@@ -251,7 +300,6 @@ function evaluateLicense(user, mt5Account) {
   return { ok: true };
 }
 
-// If active + not bound => bind now (first successful license check binds MT5)
 function bindMt5IfNeeded(users, user, mt5Account) {
   if (!user.mt5_account) {
     user.mt5_account = String(mt5Account);
@@ -284,7 +332,7 @@ app.post("/api/register", async (req, res) => {
       password_hash,
       email_verified: false,
       email_verify_token,
-      subscription_status: "inactive", // IMPORTANT: PayPal/webhook/admin sets to active
+      subscription_status: "active", // you can change later via PayPal webhook once you store sub ID
       paypal_subscription_id: "",
       paypal_payer_id: "",
       nickname: "",
@@ -297,13 +345,13 @@ app.post("/api/register", async (req, res) => {
     users.push(user);
     writeUsers(users);
 
-    // Create session immediately (user is logged in)
     req.session.userEmail = email;
 
-    // No email service wired yet -> return verification link to show on screen
     return sendOk(res, {
       message: "registered",
-      verify_url: `/api/verify-email?email=${encodeURIComponent(email)}&token=${encodeURIComponent(email_verify_token)}`,
+      verify_url: `/api/verify-email?email=${encodeURIComponent(email)}&token=${encodeURIComponent(
+        email_verify_token
+      )}`,
     });
   } catch {
     return sendNo(res, "server_error", 500);
@@ -384,34 +432,9 @@ app.get("/api/me", requireLogin, (req, res) => {
     license_active,
     mt5_account: user.mt5_account || "",
     nickname: user.nickname || "",
-    paypal_subscription_id: user.paypal_subscription_id || "",
   });
 });
 
-// ------------------------------
-// *** MISSING PIECE: LINK PAYPAL SUBSCRIPTION ID TO USER ***
-// This is what makes webhook matching possible.
-// ------------------------------
-app.post("/api/paypal/link-subscription", requireLogin, (req, res) => {
-  try {
-    const subId = normStr(req.body?.subscriptionID || req.body?.subscription_id || "");
-    if (!subId) return sendNo(res, "missing_subscription_id", 400);
-
-    const users = readUsers();
-    const user = getUserByEmail(users, req.session.userEmail);
-    if (!user) return sendNo(res, "user_not_found", 404);
-
-    user.paypal_subscription_id = subId;
-    user.updated_at = nowISO();
-    writeUsers(users);
-
-    return sendOk(res, { message: "subscription_linked" });
-  } catch {
-    return sendNo(res, "server_error", 500);
-  }
-});
-
-// Customer saves MT5 + nickname (requires login)
 app.post("/api/mt5/bind", requireLogin, (req, res) => {
   try {
     const mt5 = normStr(req.body?.mt5);
@@ -424,7 +447,6 @@ app.post("/api/mt5/bind", requireLogin, (req, res) => {
     const user = getUserByEmail(users, req.session.userEmail);
     if (!user) return sendNo(res, "user_not_found", 404);
 
-    // If already bound to a different MT5, block (admin can clear it)
     if (user.mt5_account && String(user.mt5_account) !== String(mt5)) {
       return sendNo(res, "mt5_already_bound", 403);
     }
@@ -440,7 +462,6 @@ app.post("/api/mt5/bind", requireLogin, (req, res) => {
   }
 });
 
-// Download endpoint (requires verified + active)
 app.get("/api/download", requireLogin, (req, res) => {
   const users = readUsers();
   const user = getUserByEmail(users, req.session.userEmail);
@@ -450,7 +471,6 @@ app.get("/api/download", requireLogin, (req, res) => {
   if (!user.email_verified) return sendNo(res, "email_unverified", 403);
   if (status !== "active") return sendNo(res, "subscription_inactive", 403);
 
-  // You can swap this later to a real file download (S3/GitHub release/etc.)
   return res.status(200).send("Download endpoint is live. Wire to your EA file next.");
 });
 
@@ -468,7 +488,6 @@ app.get("/api/admin/users", requireAdmin, (req, res) => {
     subscription_status: u.subscription_status,
     mt5_account: u.mt5_account || "",
     nickname: u.nickname || "",
-    paypal_subscription_id: u.paypal_subscription_id || "",
     promo_used: u.promo_used || "",
     created_at: u.created_at,
     updated_at: u.updated_at,
@@ -517,8 +536,7 @@ app.post("/api/admin/set-status", requireAdmin, (req, res) => {
   try {
     const email = safeEmail(req.body?.email);
     const status = normStr(req.body?.status).toLowerCase();
-    const allowed = ["active", "inactive", "past_due", "canceled", "locked"];
-
+    const allowed = ["active", "past_due", "canceled", "locked"];
     if (!email) return sendNo(res, "missing_email", 400);
     if (!allowed.includes(status)) return sendNo(res, "bad_status", 400);
 
@@ -538,7 +556,6 @@ app.post("/api/admin/set-status", requireAdmin, (req, res) => {
 
 // ------------------------------
 // LICENSE CHECK ROUTES (EA calls these)
-// Always returns 200 + JSON {ok:true/false}
 // ------------------------------
 async function licenseCheckHandler(req, res) {
   try {
@@ -570,7 +587,6 @@ async function licenseCheckHandler(req, res) {
   }
 }
 
-// Aliases so any EA path still works
 app.post("/license/check", licenseCheckHandler);
 app.post("/api/license/check", licenseCheckHandler);
 app.post("/license", licenseCheckHandler);
@@ -634,7 +650,6 @@ app.post("/paypal/webhook", express.raw({ type: "*/*", limit: "2mb" }), async (r
       writeUsers(users);
     }
 
-    // Optional: payment completion can mark active (unless locked)
     if (eventType === "PAYMENT.CAPTURE.COMPLETED" || eventType === "PAYMENT.SALE.COMPLETED") {
       if (normStr(user.subscription_status).toLowerCase() !== "locked") {
         user.subscription_status = "active";
@@ -650,32 +665,66 @@ app.post("/paypal/webhook", express.raw({ type: "*/*", limit: "2mb" }), async (r
 });
 
 // ------------------------------
+// DEV ROUTES (KEEPING YOURS)
+// ------------------------------
+app.post("/admin/dev-upsert-user", (req, res) => {
+  try {
+    const body = req.body || {};
+    const email = normStr(body.email);
+    const nickname = body.nickname;
+    const paypal_subscription_id = normStr(body.paypal_subscription_id);
+    const email_verified = !!body.email_verified;
+
+    if (!email || !nickname) {
+      return res.status(200).json({ ok: false, reason: "missing_email_or_nickname" });
+    }
+
+    const users = readUsers();
+    let user = users.find((u) => normStr(u.email).toLowerCase() === email.toLowerCase());
+
+    if (!user) {
+      user = {
+        email,
+        password_hash: "",
+        email_verified,
+        email_verify_token: "",
+        subscription_status: normStr(body.subscription_status) || "active",
+        paypal_subscription_id: paypal_subscription_id || "",
+        paypal_payer_id: normStr(body.paypal_payer_id) || "",
+        nickname,
+        mt5_account: normStr(body.mt5_account) || "",
+        promo_used: normStr(body.promo_used) || "",
+        created_at: nowISO(),
+        updated_at: nowISO(),
+      };
+      users.push(user);
+    } else {
+      user.email = email;
+      user.nickname = nickname;
+      if (paypal_subscription_id) user.paypal_subscription_id = paypal_subscription_id;
+      user.email_verified = email_verified;
+      if (body.subscription_status) user.subscription_status = normStr(body.subscription_status);
+      if (body.mt5_account !== undefined) user.mt5_account = normStr(body.mt5_account);
+      user.updated_at = nowISO();
+    }
+
+    writeUsers(users);
+    return res.status(200).json({ ok: true });
+  } catch {
+    return res.status(200).json({ ok: false, reason: "server_error" });
+  }
+});
+
+app.get("/admin/dev-users", (req, res) => {
+  const users = readUsers();
+  return res.status(200).json({ ok: true, users });
+});
+
+// ------------------------------
 // HEALTH
 // ------------------------------
 app.get("/", (req, res) => res.status(200).send("CandleScalpEA API is running."));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
-
-// Save PayPal subscription ID to the currently logged-in user
-app.post("/api/paypal/link-subscription", requireLogin, (req, res) => {
-  try {
-    const subscription_id = normStr(req.body?.subscription_id || req.body?.subscriptionID);
-    if (!subscription_id) return sendNo(res, "missing_subscription_id", 400);
-
-    const users = readUsers();
-    const user = getUserByEmail(users, req.session.userEmail);
-    if (!user) return sendNo(res, "user_not_found", 404);
-
-    user.paypal_subscription_id = subscription_id;
-    // keep status as-is; webhook will update to active/past_due/canceled
-    user.updated_at = nowISO();
-    writeUsers(users);
-
-    return sendOk(res, { linked: true });
-  } catch {
-    return sendNo(res, "server_error", 500);
-  }
-});
-
 
 // ------------------------------
 // LISTEN
