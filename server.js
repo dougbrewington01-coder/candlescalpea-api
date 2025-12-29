@@ -77,12 +77,12 @@ app.use(
     resave: false,
     saveUninitialized: false,
     cookie: {
-      httpOnly: true,
-      sameSite: "none",
-      secure: true
-      domain: ".candlescalpea.com",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    },
+  httpOnly: true,
+  sameSite: "none",
+  secure: true,
+  domain: ".candlescalpea.com",
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+},
   })
 );
 
