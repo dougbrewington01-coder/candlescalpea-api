@@ -304,7 +304,8 @@ function getUserByEmail(users, email) {
 function evaluateLicense(user, mt5Account) {
   if (!user) return { ok: false, reason: "user_not_found" };
 
-  if (user.email_verified === false) return { ok: false, reason: "email_unverified" };
+  // ✅ EDIT: remove email verification requirement (no email service)
+  // if (user.email_verified === false) return { ok: false, reason: "email_unverified" };
 
   const status = normStr(user.subscription_status).toLowerCase();
 
@@ -343,13 +344,13 @@ app.post("/api/register", async (req, res) => {
     if (getUserByEmail(users, email)) return sendNo(res, "email_exists", 409);
 
     const password_hash = await bcrypt.hash(password, 12);
-    const email_verify_token = crypto.randomBytes(24).toString("hex");
 
+    // ✅ EDIT: no email verification tokens / no verify email flow
     const user = {
       email,
       password_hash,
-      email_verified: false,
-      email_verify_token,
+      email_verified: true,        // ✅ auto-verified (no email service)
+      email_verify_token: "",      // ✅ unused
       subscription_status: "active", // you can change later via PayPal webhook once you store sub ID
       paypal_subscription_id: "",
       paypal_payer_id: "",
@@ -365,42 +366,14 @@ app.post("/api/register", async (req, res) => {
 
     req.session.userEmail = email;
 
-    return sendOk(res, {
-      message: "registered",
-      verify_url: `/api/verify-email?email=${encodeURIComponent(email)}&token=${encodeURIComponent(
-        email_verify_token
-      )}`,
-    });
+    // ✅ EDIT: no verify_url returned
+    return sendOk(res, { message: "registered" });
   } catch {
     return sendNo(res, "server_error", 500);
   }
 });
 
-app.get("/api/verify-email", (req, res) => {
-  try {
-    const email = safeEmail(req.query?.email);
-    const token = normStr(req.query?.token);
-
-    if (!email || !token) return res.status(400).send("Missing email or token.");
-
-    const users = readUsers();
-    const user = getUserByEmail(users, email);
-    if (!user) return res.status(404).send("User not found.");
-
-    if (user.email_verified) return res.status(200).send("Email already verified.");
-
-    if (user.email_verify_token !== token) return res.status(403).send("Invalid token.");
-
-    user.email_verified = true;
-    user.email_verify_token = "";
-    user.updated_at = nowISO();
-    writeUsers(users);
-
-    return res.status(200).send("Email verified. You can go back to the site and log in.");
-  } catch {
-    return res.status(500).send("Server error.");
-  }
-});
+// ✅ EDIT: removed /api/verify-email route entirely (no email verification)
 
 app.post("/api/login", async (req, res) => {
   try {
@@ -439,12 +412,14 @@ app.get("/api/me", requireLogin, (req, res) => {
 
   const status = normStr(user.subscription_status).toLowerCase();
   const subscription_active = status === "active";
-  const license_active = user.email_verified && subscription_active && status !== "locked";
+
+  // ✅ EDIT: email_verified is always true now, but keep field for UI compatibility
+  const license_active = subscription_active && status !== "locked";
 
   return res.status(200).json({
     ok: true,
     email: user.email,
-    email_verified: !!user.email_verified,
+    email_verified: true, // ✅ always true (no email service)
     subscription_active,
     subscription_status: user.subscription_status,
     license_active,
@@ -486,7 +461,9 @@ app.get("/api/download", requireLogin, (req, res) => {
   if (!user) return sendNo(res, "user_not_found", 404);
 
   const status = normStr(user.subscription_status).toLowerCase();
-  if (!user.email_verified) return sendNo(res, "email_unverified", 403);
+
+  // ✅ EDIT: removed email verification requirement
+  // if (!user.email_verified) return sendNo(res, "email_unverified", 403);
   if (status !== "active") return sendNo(res, "subscription_inactive", 403);
 
   return res.status(200).send("Download endpoint is live. Wire to your EA file next.");
