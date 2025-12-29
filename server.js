@@ -78,9 +78,9 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      // ✅ FIX: cross-domain cookies require SameSite=None
       sameSite: "none",
-      secure: FORCE_SECURE_COOKIE, // DO = true, local testing can set FORCE_SECURE_COOKIE=false
+      secure: true
+      domain: ".candlescalpea.com",
       maxAge: 7 * 24 * 60 * 60 * 1000,
     },
   })
