@@ -744,6 +744,20 @@ app.get("/admin/dev-users", (req, res) => {
 app.get("/", (req, res) => res.status(200).send("CandleScalpEA API is running."));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
+app.post("/api/auth/register", async (req, res) => {
+  const { email, password, confirm_password } = req.body;
+
+  if (!email || !password || !confirm_password) {
+    return res.status(400).json({ ok: false, error: "Missing fields" });
+  }
+
+  if (password !== confirm_password) {
+    return res.status(400).json({ ok: false, error: "Passwords do not match" });
+  }
+
+  return res.json({ ok: true });
+});
+
 // ------------------------------
 // LISTEN
 // ------------------------------
